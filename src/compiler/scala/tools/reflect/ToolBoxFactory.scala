@@ -48,6 +48,7 @@ abstract class ToolBoxFactory[U <: JavaUniverse](val u: U) { factorySelf =>
 
       private final val wrapperMethodName = "wrapper"
 
+
       private def nextWrapperModuleName() = {
         wrapCount += 1
         // we need to use UUIDs here, because our toolbox might be spawned by another toolbox
@@ -187,17 +188,71 @@ abstract class ToolBoxFactory[U <: JavaUniverse](val u: U) { factorySelf =>
             analyzer.inferImplicit(tree, pt, isView, currentTyper.context, silent, withMacrosDisabled, pos, (pos, msg) => throw ToolBoxError(msg))
           })
 
-      private def wrapInPackageAndCompile(packageName: TermName, tree: ImplDef): Symbol = {
-        val pdef = PackageDef(Ident(packageName), List(tree))
+      private def wrapInPackageAndCompile(packageName: TermName, tree0: ImplDef, addPackageObject: Boolean = false): Symbol = {
+        val (pdef, tree, initFun) = 
+          if (addPackageObject) {
+            val (po, impl, initFun) = packageObjectFor(packageName, tree0)
+            (PackageDef(Ident(packageName), List(po, impl)), impl, initFun)
+          } else {
+            (PackageDef(Ident(packageName), List(tree0)), tree0, () => ())
+          }
+        trace("wrapped: ")(showAttributed(pdef, true, true, settings.Yshowsymowners.value, settings.Yshowsymkinds.value))
         val unit = new CompilationUnit(NoSourceFile)
         unit.body = pdef
+        
 
         val run = new Run
         reporter.reset()
         run.compileUnits(List(unit), run.namerPhase)
         throwIfErrors()
-
+        initFun()
         tree.symbol
+      }
+      
+      private def packageObjectFor(packageName : TermName, tree0: ImplDef): (Tree, Tree, () => Unit) = {
+        val (tree, freeMap) = extractFreeTerms(tree0, false)
+        def wrapperVarAndVal(s: (List[ValDef], () => Unit), freeTerm: (FreeTermSymbol, TermName)) = {
+          val (vals, initFun0) = s 
+          val tpe = freeTerm._1.tpe.resultType
+          
+          val varMods = Modifiers(MUTABLE)
+          val varName = newTermName("_" + freeTerm._2.toString)
+          val varTpe = TypeTree(appliedType(definitions.FunctionClass(0).tpe, List(tpe)))
+          val varDef = ValDef(varMods, varName, varTpe, Literal(Constant(null))) 
+          
+          val valMods = Modifiers(LAZY)
+          val valName = freeTerm._2
+          val valTpe = TypeTree(tpe)
+          val valDef = ValDef(valMods, valName, valTpe, Apply(Ident(varName), List()))
+          
+          val initFun = () => {
+            initFun0()
+            val jclazz = jClass.forName(packageName.toString + ".package$", true, classLoader)
+            val jfield = jclazz.getDeclaredFields.find(_.getName == NameTransformer.MODULE_INSTANCE_NAME).get
+            val singleton = jfield.get(null)
+            val jVarSetter = jclazz.getDeclaredMethods.find(_.getName == varName.toString + NameTransformer.SETTER_SUFFIX_STRING).get
+            jVarSetter.invoke(singleton, () => freeTerm._1.value)
+            ()
+          }
+          (vals :+ varDef :+ valDef, initFun)
+        }
+        
+        val (wrapperVarsAndVals, initFun) = freeMap.foldLeft((List.empty[ValDef], () => ()))(wrapperVarAndVal)
+        (ModuleDef(
+            Modifiers(),
+            termNames.PACKAGE,
+            Template(
+                List(),
+                noSelfType,
+                DefDef(
+                    Modifiers(),
+                    termNames.CONSTRUCTOR,
+                    List(),
+                    List(List()),
+                    TypeTree(),
+                    Block(List(pendingSuperCall), Literal(Constant(())))) +: wrapperVarsAndVals)),
+         tree,
+         initFun)
       }
 
       def compile(expr0: Tree): () => Any = {
@@ -279,10 +334,8 @@ abstract class ToolBoxFactory[U <: JavaUniverse](val u: U) { factorySelf =>
       }
 
       def define(tree: ImplDef): Symbol = {
-        val freeTerms = tree.freeTerms
-        if (freeTerms.nonEmpty) throw ToolBoxError(s"reflective toolbox has failed: cannot have free terms in a top-level definition")
         verify(tree)
-        wrapInPackageAndCompile(nextWrapperModuleName(), tree)
+        wrapInPackageAndCompile(nextWrapperModuleName(), tree, true)
       }
 
       def parse(code: String): Tree = {
